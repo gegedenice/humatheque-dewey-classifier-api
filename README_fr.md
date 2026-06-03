@@ -177,6 +177,7 @@ Copiez `.example.env` vers `.env` et ajustez les valeurs.
 | `CLASSIFICATION_API_KEY` | vide | Clé API optionnelle (`API_KEY` est aussi acceptée) |
 | `EMBEDDING_MODEL` | `intfloat/multilingual-e5-large` | Identifiant du modèle d'embeddings |
 | `EMBEDDING_DEVICE` | `cpu` | Périphérique d'inférence (`cpu`, `cuda:0`, ...) |
+| `HF_TOKEN` | vide | Jeton Hugging Face optionnel pour télécharger le modèle (`HUGGING_FACE_HUB_TOKEN` est aussi accepté) ; requis pour les modèles privés/restreints |
 | `EMBEDDING_QUERY_PREFIX` | `"query: "` | Préfixe du texte recherché (propre au modèle ; conserver l'espace final) |
 | `EMBEDDING_PASSAGE_PREFIX` | `"passage: "` | Préfixe des descriptions de classes / exemples (conserver l'espace final) |
 | `TAXONOMY_PATH` | `taxonomy.json` | Chemin de la taxonomie Dewey faisant autorité |

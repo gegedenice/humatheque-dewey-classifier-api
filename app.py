@@ -25,9 +25,11 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-large")
 EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cpu")
+# Optional Hugging Face access token, used to download the embedding model
+# (required for gated/private models, raises anonymous rate limits otherwise).
+HF_TOKEN = os.getenv("HF_TOKEN", os.getenv("HUGGING_FACE_HUB_TOKEN", "")) or None
 # e5 / bge models are trained with asymmetric prefixes; the search text is a
 # "query" and the class descriptions / examples are "passages". Override (e.g. to
 # empty strings) for models that don't use prefixes.
@@ -196,7 +198,7 @@ def get_classifier() -> Classifier:
     """Load the embedding model and build the taxonomy index once per process."""
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(EMBEDDING_MODEL, device=EMBEDDING_DEVICE)
+    model = SentenceTransformer(EMBEDDING_MODEL, device=EMBEDDING_DEVICE, token=HF_TOKEN)
     return Classifier(model, load_taxonomy(), load_examples())
 
 

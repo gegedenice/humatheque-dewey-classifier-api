@@ -170,6 +170,7 @@ Copy `.example.env` to `.env` and adjust values.
 | `CLASSIFICATION_API_KEY` | empty | Optional API key (`API_KEY` is also honored) |
 | `EMBEDDING_MODEL` | `intfloat/multilingual-e5-large` | Sentence-embedding model identifier |
 | `EMBEDDING_DEVICE` | `cpu` | Inference device (`cpu`, `cuda:0`, ...) |
+| `HF_TOKEN` | empty | Optional Hugging Face token for downloading the model (`HUGGING_FACE_HUB_TOKEN` is also honored); needed for gated/private models |
 | `EMBEDDING_QUERY_PREFIX` | `"query: "` | Prefix for the search text (model-specific; keep trailing space) |
 | `EMBEDDING_PASSAGE_PREFIX` | `"passage: "` | Prefix for class descriptions / examples (keep trailing space) |
 | `TAXONOMY_PATH` | `taxonomy.json` | Path to the authoritative Dewey taxonomy |
