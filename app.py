@@ -20,7 +20,7 @@ GLICLASS_DEVICE = os.getenv("GLICLASS_DEVICE", "cpu")
 GLICLASS_DTYPE = os.getenv("GLICLASS_DTYPE", "float32")
 DEFAULT_CLASSIFICATION_TYPE = os.getenv("GLICLASS_CLASSIFICATION_TYPE", "multi-label")
 DEFAULT_THRESHOLD = float(os.getenv("GLICLASS_THRESHOLD", "0.5"))
-DEFAULT_MAX_LENGTH = int(os.getenv("GLICLASS_MAX_LENGTH", "1024"))
+DEFAULT_MAX_LENGTH = int(os.getenv("GLICLASS_MAX_LENGTH", "4096"))
 API_KEY = os.getenv("CLASSIFICATION_API_KEY", os.getenv("API_KEY", ""))
 
 # Default labels are the Dewey divisions (main classes and their hundred-level
