@@ -35,6 +35,14 @@ DEFAULT_LABELS_CHUNK_SIZE = int(os.getenv("GLICLASS_LABELS_CHUNK_SIZE", "8"))
 # subdivisions -- so the model never weighs more than ~10-20 labels in one pass.
 TWO_STAGE_MIN_LABELS = int(os.getenv("GLICLASS_TWO_STAGE_MIN_LABELS", "25"))
 STAGE1_TOP_K = int(os.getenv("GLICLASS_STAGE1_TOP_K", "2"))
+# The bare `X00` main-class labels ("Géographie et histoire", "Sciences de la
+# nature et mathématiques", ...) are broad catch-alls that the model scores high
+# on almost any text, so they drown out the specific subdivision that should win.
+# By default they are dropped from the stage-2 candidates (they still drive the
+# stage-1 area selection), forcing a specific class. Set to true to keep them.
+STAGE2_INCLUDE_PARENT = os.getenv(
+    "GLICLASS_STAGE2_INCLUDE_PARENT", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 API_KEY = os.getenv("CLASSIFICATION_API_KEY", os.getenv("API_KEY", ""))
 
 # Default labels are the Dewey divisions (main classes and their hundred-level
@@ -370,9 +378,13 @@ def classify_two_stage(
             for r in ranked[:STAGE1_TOP_K]
             if main_to_codes.get(str(r["label"]))
         }
-        sub_labels = [
-            entry for main in chosen_mains for entry in subdivisions.get(main, [])
-        ]
+        sub_labels: list[dict[str, str]] = []
+        for main in chosen_mains:
+            group = subdivisions.get(main, [])
+            # Drop the broad parent label unless it is the group's only entry.
+            if not STAGE2_INCLUDE_PARENT and len(group) > 1:
+                group = [entry for entry in group if next(iter(entry)) != main]
+            sub_labels.extend(group)
         results.extend(
             classify_flat([text], sub_labels, classification_type, threshold, top_k)
         )
