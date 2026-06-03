@@ -20,7 +20,13 @@ GLICLASS_DEVICE = os.getenv("GLICLASS_DEVICE", "cpu")
 GLICLASS_DTYPE = os.getenv("GLICLASS_DTYPE", "float32")
 DEFAULT_CLASSIFICATION_TYPE = os.getenv("GLICLASS_CLASSIFICATION_TYPE", "multi-label")
 DEFAULT_THRESHOLD = float(os.getenv("GLICLASS_THRESHOLD", "0.5"))
-DEFAULT_MAX_LENGTH = int(os.getenv("GLICLASS_MAX_LENGTH", "4096"))
+DEFAULT_MAX_LENGTH = int(os.getenv("GLICLASS_MAX_LENGTH", "2048"))
+# GLiClass (uni-encoder) packs every label into one forward pass and is trained
+# around ~25 classes; scoring all ~94 Dewey labels at once makes the model ignore
+# the text and return a near-constant ranking. The chunking pipeline scores the
+# labels in small batches (each with the full text) and max-pools, keeping every
+# pass in-distribution. Tune the batch size via GLICLASS_LABELS_CHUNK_SIZE.
+DEFAULT_LABELS_CHUNK_SIZE = int(os.getenv("GLICLASS_LABELS_CHUNK_SIZE", "8"))
 API_KEY = os.getenv("CLASSIFICATION_API_KEY", os.getenv("API_KEY", ""))
 
 # Default labels are the Dewey divisions (main classes and their hundred-level
@@ -215,17 +221,19 @@ def get_pipeline(classification_type: str) -> Any:
     The model and tokenizer are heavy to load, so each (model, classification_type)
     pipeline is memoized and reused across requests.
     """
-    from gliclass import GLiClassModel, ZeroShotClassificationPipeline
+    from gliclass import GLiClassModel, ZeroShotClassificationWithChunkingPipeline
     from transformers import AutoTokenizer
 
     model = GLiClassModel.from_pretrained(GLICLASS_MODEL, dtype=torch_dtype(GLICLASS_DTYPE))
     tokenizer = AutoTokenizer.from_pretrained(GLICLASS_MODEL)
-    return ZeroShotClassificationPipeline(
+    return ZeroShotClassificationWithChunkingPipeline(
         model,
         tokenizer,
         classification_type=classification_type,
         device=GLICLASS_DEVICE,
         max_length=DEFAULT_MAX_LENGTH,
+        labels_chunk_size=DEFAULT_LABELS_CHUNK_SIZE,
+        progress_bar=False,
     )
 
 
@@ -321,7 +329,6 @@ async def classify_endpoint(
     _: None = Depends(require_api_key),
 ) -> dict[str, Any]:
     return await run_in_threadpool(classify, payload)
-
 
 if __name__ == "__main__":
     import uvicorn
