@@ -27,6 +27,14 @@ DEFAULT_MAX_LENGTH = int(os.getenv("GLICLASS_MAX_LENGTH", "2048"))
 # labels in small batches (each with the full text) and max-pools, keeping every
 # pass in-distribution. Tune the batch size via GLICLASS_LABELS_CHUNK_SIZE.
 DEFAULT_LABELS_CHUNK_SIZE = int(os.getenv("GLICLASS_LABELS_CHUNK_SIZE", "8"))
+# Two-stage routing. GLiClass discriminates well among a handful of labels but
+# collapses (constant, over-confident ranking) when scoring the full ~94-class
+# Dewey taxonomy at once. When the taxonomy is larger than TWO_STAGE_MIN_LABELS
+# and Dewey-structured (a `X00` main-class entry exists for every group), we first
+# rank the 10 main classes, keep the STAGE1_TOP_K best, then classify only their
+# subdivisions -- so the model never weighs more than ~10-20 labels in one pass.
+TWO_STAGE_MIN_LABELS = int(os.getenv("GLICLASS_TWO_STAGE_MIN_LABELS", "25"))
+STAGE1_TOP_K = int(os.getenv("GLICLASS_STAGE1_TOP_K", "2"))
 API_KEY = os.getenv("CLASSIFICATION_API_KEY", os.getenv("API_KEY", ""))
 
 # Default labels are the Dewey divisions (main classes and their hundred-level
@@ -280,23 +288,114 @@ def to_label_scores(
     return scored
 
 
+def main_class_code(code: str) -> str:
+    """Dewey main class for a code: first digit padded to `X00` (e.g. 944 -> 900)."""
+    digit = code.strip()[:1] or "0"
+    return f"{digit}00"
+
+
+def split_taxonomy(
+    labels: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], dict[str, list[dict[str, str]]]] | None:
+    """Group `{code: label}` entries by Dewey main class for two-stage routing.
+
+    Returns `(main_labels, subdivisions)` where `main_labels` is the list of the
+    `X00` entries and `subdivisions` maps each main code to its member entries
+    (the main entry included). Returns `None` when the taxonomy is not usable for
+    two-stage routing -- too small, or some group has no `X00` main entry -- so the
+    caller falls back to a single flat pass.
+    """
+    subdivisions: dict[str, list[dict[str, str]]] = {}
+    main_entry: dict[str, dict[str, str]] = {}
+    for entry in labels:
+        for code, label in entry.items():
+            code = str(code).strip()
+            if not str(label).strip():
+                continue
+            main = main_class_code(code)
+            subdivisions.setdefault(main, []).append({code: label})
+            if code == main:
+                main_entry[main] = {code: label}
+
+    if len(labels) <= TWO_STAGE_MIN_LABELS:
+        return None
+    if any(main not in main_entry for main in subdivisions):
+        return None  # not cleanly Dewey-structured; flat pass is safer
+
+    main_labels = [main_entry[main] for main in sorted(subdivisions)]
+    return main_labels, subdivisions
+
+
+def classify_flat(
+    texts: list[str],
+    labels: list[dict[str, str]],
+    classification_type: str,
+    threshold: float,
+    top_k: int | None,
+) -> list[TextClassification]:
+    """Single-pass classification of every text against one shared label set."""
+    ordered_labels, label_to_codes = parse_labels(labels)
+    pipeline = get_pipeline(classification_type)
+    raw_batches = pipeline(texts, ordered_labels, threshold=threshold)
+    return [
+        TextClassification(text=text, classes=to_label_scores(raw, label_to_codes, top_k))
+        for text, raw in zip(texts, raw_batches)
+    ]
+
+
+def classify_two_stage(
+    texts: list[str],
+    main_labels: list[dict[str, str]],
+    subdivisions: dict[str, list[dict[str, str]]],
+    classification_type: str,
+    threshold: float,
+    top_k: int | None,
+) -> list[TextClassification]:
+    """Rank the Dewey main classes, then classify within the top STAGE1_TOP_K.
+
+    Stage 1 scores all main classes (threshold 0, so every main is ranked) and
+    keeps the STAGE1_TOP_K best per text. Stage 2 classifies each text against
+    only the subdivisions of its selected main classes, honouring the caller's
+    classification type / threshold / top_k. Stage 2 label sets differ per text,
+    so each text is run on its own.
+    """
+    main_ordered, main_to_codes = parse_labels(main_labels)
+    stage1 = get_pipeline("multi-label")(texts, main_ordered, threshold=0.0)
+
+    results: list[TextClassification] = []
+    for text, raw in zip(texts, stage1):
+        ranked = sorted(raw, key=lambda r: r.get("score", 0.0), reverse=True)
+        chosen_mains = {
+            main_to_codes[str(r["label"])][0]
+            for r in ranked[:STAGE1_TOP_K]
+            if main_to_codes.get(str(r["label"]))
+        }
+        sub_labels = [
+            entry for main in chosen_mains for entry in subdivisions.get(main, [])
+        ]
+        results.extend(
+            classify_flat([text], sub_labels, classification_type, threshold, top_k)
+        )
+    return results
+
+
 def classify(payload: ClassifyRequest) -> dict[str, Any]:
     texts = [payload.text] if isinstance(payload.text, str) else list(payload.text)
     if not texts or all(not text.strip() for text in texts):
         raise HTTPException(status_code=400, detail="Provide non-empty text.")
 
-    ordered_labels, label_to_codes = parse_labels(payload.labels)
-
-    pipeline = get_pipeline(payload.classification_type)
-    raw_batches = pipeline(texts, ordered_labels, threshold=payload.threshold)
-
-    results = [
-        TextClassification(
-            text=text,
-            classes=to_label_scores(raw, label_to_codes, payload.top_k),
+    split = split_taxonomy(payload.labels)
+    if split is None:
+        results = classify_flat(
+            texts, payload.labels, payload.classification_type,
+            payload.threshold, payload.top_k,
         )
-        for text, raw in zip(texts, raw_batches)
-    ]
+    else:
+        main_labels, subdivisions = split
+        results = classify_two_stage(
+            texts, main_labels, subdivisions, payload.classification_type,
+            payload.threshold, payload.top_k,
+        )
 
     return {
         "source": "gliclass_classification",
