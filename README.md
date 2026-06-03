@@ -1,56 +1,77 @@
 # Humatheque Classification API
 
-FastAPI service for zero-shot classification of academic text against a Dewey
-taxonomy, using the GLiClass `gliclass-modern-large-v3.0` model.
+Local FastAPI service that assigns a **Dewey class** to short academic text
+(titles, occasionally abstracts) by **semantic similarity** — fully offline, with
+open-weights models and no paid API.
 
-The service is designed for a cataloging pipeline where text (a title, abstract,
-or extracted document content) needs a discipline / Dewey assignment. A client
-posts the text and a candidate taxonomy, and the API returns the matching
-classes with their model confidence scores.
+The service is designed for a cataloging pipeline where a piece of text needs a
+discipline / Dewey assignment. A client posts the text; the API embeds it with a
+local multilingual sentence-embedding model, ranks it against the Dewey taxonomy,
+and returns the best-matching classes with a similarity score. Each returned
+class carries `dewey` + `label` + `score`.
 
-The taxonomy is supplied as a list of `{dewey_code: discipline_label}` entries.
-Only the discipline label is sent to the model (GLiClass classifies on the label
-text), and the response re-attaches the Dewey code to every scored class, so each
-returned class carries `dewey` + `label` + `score`.
+## How it works
 
-## Model
+The classes are a fixed, authoritative Dewey taxonomy stored in `taxonomy.json`.
+Each entry has three fields:
 
-The service uses the GLiClass library and the
-[`knowledgator/gliclass-modern-large-v3.0`](https://huggingface.co/knowledgator/gliclass-modern-large-v3.0)
-model, served through `ZeroShotClassificationPipeline`:
-
-```python
-from gliclass import GLiClassModel, ZeroShotClassificationPipeline
-from transformers import AutoTokenizer
-import torch
-
-model = GLiClassModel.from_pretrained("knowledgator/gliclass-modern-large-v3.0", dtype=torch.float32)
-tokenizer = AutoTokenizer.from_pretrained("knowledgator/gliclass-modern-large-v3.0")
-pipeline = ZeroShotClassificationPipeline(model, tokenizer, classification_type="multi-label", device="cpu")
+```json
+{"code": "980", "label": "Histoire générale de l'Amérique du Sud",
+ "description": "Histoire de l'Amérique du Sud et latine, Argentine, Brésil, Buenos Aires, indépendances sud-américaines"}
 ```
 
-The pipeline is built once per `classification_type` and cached for the lifetime
-of the process. The first request pays the model-load cost; subsequent requests
-reuse the loaded model. Inference runs in a threadpool so the event loop is not
-blocked.
+- `code` + `label` are **authoritative** — they are exactly what the API returns.
+- `description` is **internal**: an enriched set of keywords (place names, eras,
+  fields, synonyms) used only to build the class embedding.
 
-GLiClass natively supports both single-text and batch classification, so this
-service accepts either a single `text` string or a list of texts in one request.
+Why the enrichment matters: incoming titles are terse and very specific (e.g. a
+thesis subject), and must roll up to a *broader* category. A bare label string
+cannot connect "Buenos Aires, 1829" to "Amérique du Sud" — the discriminating
+vocabulary in `description` is what makes that mapping work. **Improving accuracy
+is done by editing `taxonomy.json`, not by tuning the model**, and a cataloger
+can do it without touching Python.
 
-## Classification logic
+### Classification logic
 
 `POST /classify`:
 
-1. Normalize `text` to a list (single string or batch).
-2. Parse `labels` (`[{code: label}, ...]`) into:
-   - the ordered list of discipline labels passed to the model
-   - a `label -> [dewey codes]` map used to re-attach codes in the response
-3. Run the GLiClass pipeline with the requested `threshold`.
-4. For each text, return classes above the threshold as `dewey` + `label` +
-   `score`, sorted by descending score (optionally capped by `top_k`).
+1. Embed each Dewey class once at startup as `"{label}. {description}"` (with the
+   model's passage prefix). The index is built once per process and cached.
+2. Embed the incoming text (with the query prefix).
+3. Rank classes by cosine similarity, drop anything below `threshold`, sort, and
+   return the top `top_k`.
 
-`multi-label` (default) returns every label whose score passes the threshold.
-`single-label` returns the single best class.
+`multi-label` (default) returns up to `top_k` classes; `single-label` returns the
+single best class.
+
+### Model
+
+The default model is
+[`intfloat/multilingual-e5-large`](https://huggingface.co/intfloat/multilingual-e5-large),
+served via `sentence-transformers`. It is multilingual (strong on French), runs
+on CPU, and is fully local. Swap it with `EMBEDDING_MODEL` (e.g. `BAAI/bge-m3`,
+`intfloat/multilingual-e5-base` for lower latency).
+
+e5/bge models use asymmetric prefixes — the search text is a `query: ` and the
+class descriptions are `passage: `. These are configurable and **must keep their
+trailing space** (hence the quoting in `.example.env`).
+
+### Improving over time (k-NN)
+
+The index can also match against previously catalogued examples. Point
+`EXAMPLES_PATH` at a JSON file of confirmed assignments:
+
+```json
+[
+  {"text": "Étude des algorithmes d'apprentissage automatique", "code": "004"},
+  {"text": "Histoire politique de Buenos Aires au XIXe siècle", "code": "980"}
+]
+```
+
+Each example is embedded per class and blended with the description similarity as
+`final = max(description_similarity, EMBEDDING_EXAMPLE_WEIGHT × best_example_similarity)`,
+so confirmed assignments can only improve results. Leave `EXAMPLES_PATH` empty to
+disable.
 
 ## Endpoints
 
@@ -70,80 +91,63 @@ Request body:
 
 ```json
 {
-  "text": "Étude des algorithmes d'apprentissage automatique appliqués au traitement du langage.",
-  "labels": [
-    {"000": "Informatique, information, généralités"},
-    {"004": "Informatique"},
-    {"020": "Bibliothéconomie et sciences de l'information"},
-    {"100": "Les divers systèmes et écoles philosophiques"},
-    {"200": "Religion"}
-  ],
-  "threshold": 0.5,
+  "text": "Handbook on large language models and embeddings models.",
+  "codes": null,
+  "threshold": 0.0,
   "classification_type": "multi-label",
-  "top_k": null
+  "top_k": 5
 }
 ```
 
 | Field | Required | Description |
 |---|---:|---|
 | `text` | yes | A string, or a list of strings for batch classification |
-| `labels` | no | List of `{dewey_code: discipline_label}` entries; defaults to the Dewey divisions (main classes and hundred-level subdivisions) |
-| `threshold` | no | Minimum score to return a class, default `0.5` |
-| `classification_type` | no | `multi-label` (default) or `single-label` |
-| `top_k` | no | Optional cap on returned classes per text |
-
-`labels` only sends the discipline label to the model; the Dewey code is mapped
-back onto each result. If several codes share the same label text, every code is
-returned for that label.
+| `codes` | no | Optional subset of Dewey codes to restrict candidates to (e.g. `["004","510"]`); defaults to the full taxonomy. Unknown codes are ignored |
+| `threshold` | no | Minimum cosine similarity to return a class, default `0.0` |
+| `classification_type` | no | `multi-label` (default, up to `top_k`) or `single-label` (best one) |
+| `top_k` | no | Cap on returned classes per text; default from `CLASSIFICATION_TOP_K` (`5`) |
 
 Example:
 
 ```bash
-curl -X POST "http://localhost:8000/classify" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: ${API_KEY}" \
-  -d '{
-    "text": "Étude des algorithmes dapprentissage automatique appliqués au traitement du langage.",
-    "labels": [
-      {"004": "Informatique"},
-      {"100": "Les divers systèmes et écoles philosophiques"},
-      {"200": "Religion"}
-    ],
-    "threshold": 0.5
-  }'
+curl -s localhost:8000/classify -H 'Content-Type: application/json' -d '{
+  "text": "Handbook on large language models and embeddings models.",
+  "top_k": 3
+}'
 ```
 
 Response shape:
 
 ```jsonc
 {
-  "source": "gliclass_classification",
-  "model": "knowledgator/gliclass-modern-large-v3.0",
+  "source": "embedding_classification",
+  "model": "intfloat/multilingual-e5-large",
   "classification_type": "multi-label",
-  "threshold": 0.5,
+  "threshold": 0.0,
   "count": 1,
   "results": [
     {
-      "text": "Étude des algorithmes d'apprentissage automatique...",
+      "text": "Handbook on large language models and embeddings models.",
       "classes": [
-        {"dewey": "200", "label": "Religion", "score": 0.92},
-        {"dewey": "004", "label": "Informatique", "score": 0.916},
-        {"dewey": "100", "label": "Les divers systèmes et écoles philosophiques", "score": 0.904}
+        {"dewey": "004", "label": "Informatique", "score": 0.88},
+        {"dewey": "410", "label": "Linguistique générale", "score": 0.84},
+        {"dewey": "510", "label": "Mathématiques", "score": 0.81}
       ]
     }
   ]
 }
 ```
 
-Batch classification posts a list of texts and returns one entry per text in
-`results`:
+Batch classification posts a list of texts and returns one entry per text:
 
 ```json
-{
-  "text": ["Premier texte à classer.", "Second texte à classer."],
-  "labels": [{"004": "Informatique"}, {"200": "Religion"}]
-}
+{"text": ["Premier texte à classer.", "Second texte à classer."], "top_k": 3}
 ```
+
+> **Note on scores:** these are cosine similarities, not calibrated
+> probabilities. With e5-style models they cluster high (≈0.7–0.9) even for weak
+> matches, so treat them as a *ranking*. `threshold` defaults to `0.0`; rely on
+> `top_k` and human-in-the-loop confirmation rather than a hard cutoff.
 
 ## Authentication
 
@@ -164,12 +168,16 @@ Copy `.example.env` to `.env` and adjust values.
 |---|---|---|
 | `PORT` | `8000` | HTTP server port |
 | `CLASSIFICATION_API_KEY` | empty | Optional API key (`API_KEY` is also honored) |
-| `GLICLASS_MODEL` | `knowledgator/gliclass-modern-large-v3.0` | GLiClass model identifier |
-| `GLICLASS_DEVICE` | `cpu` | Inference device (`cpu`, `cuda:0`, ...) |
-| `GLICLASS_DTYPE` | `float32` | Model dtype (`float32`, `float16`, `bfloat16`) |
-| `GLICLASS_CLASSIFICATION_TYPE` | `multi-label` | Default classification type |
-| `GLICLASS_THRESHOLD` | `0.5` | Default score threshold |
-| `GLICLASS_MAX_LENGTH` | `1024` | Maximum token length per text |
+| `EMBEDDING_MODEL` | `intfloat/multilingual-e5-large` | Sentence-embedding model identifier |
+| `EMBEDDING_DEVICE` | `cpu` | Inference device (`cpu`, `cuda:0`, ...) |
+| `EMBEDDING_QUERY_PREFIX` | `"query: "` | Prefix for the search text (model-specific; keep trailing space) |
+| `EMBEDDING_PASSAGE_PREFIX` | `"passage: "` | Prefix for class descriptions / examples (keep trailing space) |
+| `TAXONOMY_PATH` | `taxonomy.json` | Path to the authoritative Dewey taxonomy |
+| `EXAMPLES_PATH` | empty | Optional JSON of catalogued `{text, code}` examples for k-NN |
+| `EMBEDDING_EXAMPLE_WEIGHT` | `1.0` | Weight on the best example similarity when blending |
+| `CLASSIFICATION_TOP_K` | `5` | Default cap on returned classes per text |
+| `CLASSIFICATION_THRESHOLD` | `0.0` | Default minimum cosine similarity |
+| `CLASSIFICATION_TYPE` | `multi-label` | Default classification type |
 
 ## Local run
 
@@ -179,8 +187,8 @@ pip install -r requirements.txt
 uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-The first request downloads the model from Hugging Face and loads it into
-memory, so it is slower than later requests.
+The first request downloads the embedding model from Hugging Face and builds the
+taxonomy index; subsequent requests reuse the loaded model.
 
 ## Docker
 
@@ -189,18 +197,16 @@ docker build -t humatheque-classification-api .
 docker run --env-file .env -p 8000:8000 humatheque-classification-api
 ```
 
-The Docker image follows the same deployment style as the other Humatheque
-services: Python slim image, `requirements.txt`, non-root user, and
-`uvicorn app:app`. The Hugging Face cache lives under `/app/.cache/huggingface`;
-mount a volume there to avoid re-downloading the model on each container start.
+The Hugging Face cache lives under `/app/.cache/huggingface`; mount a volume
+there to avoid re-downloading the model on each container start.
 
 ## Operational notes
 
-- The model is loaded lazily on the first request and cached per
-  `classification_type` for the process lifetime.
-- Inference is CPU-bound; it runs in a threadpool so it does not block the event
-  loop, but a single worker processes one batch at a time.
-- For throughput, prefer batch requests (a list of texts) over many single-text
-  requests, since GLiClass batches them in one forward pass.
-- `gliclass-modern-large-v3.0` is the large variant; for lower-latency serving
-  consider a smaller GLiClass model via `GLICLASS_MODEL`.
+- The model and taxonomy index are loaded once and cached for the process
+  lifetime. **Restart the service** to pick up changes to `taxonomy.json`,
+  `EXAMPLES_PATH`, or the model.
+- Embedding is CPU-bound; it runs in a threadpool so it does not block the event
+  loop, but a single worker processes one request at a time.
+- For throughput, prefer batch requests (a list of texts).
+- Accuracy is driven by the `description` keywords in `taxonomy.json` and by the
+  optional catalogued examples — not by model parameters.

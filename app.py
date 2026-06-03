@@ -1,9 +1,20 @@
-"""FastAPI service for zero-shot Dewey classification with GLiClass."""
+"""FastAPI service for local, zero-shot Dewey classification by embedding retrieval.
+
+The incoming text is embedded with a local multilingual sentence-embedding model
+and ranked by cosine similarity against the Dewey taxonomy. Each class is
+represented by an *enriched description* (authoritative label + curated keywords)
+so that very specific titles map onto the correct broad category -- which a bare
+label string cannot do. Optionally, previously catalogued `{text -> code}`
+examples are matched as well (k-NN), so the system improves as the catalogue
+grows. Only the authoritative `code` + `label` are ever returned.
+"""
 
 from __future__ import annotations
 
+import json
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -15,151 +26,36 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 
-GLICLASS_MODEL = os.getenv("GLICLASS_MODEL", "knowledgator/gliclass-modern-large-v3.0")
-GLICLASS_DEVICE = os.getenv("GLICLASS_DEVICE", "cpu")
-GLICLASS_DTYPE = os.getenv("GLICLASS_DTYPE", "float32")
-DEFAULT_CLASSIFICATION_TYPE = os.getenv("GLICLASS_CLASSIFICATION_TYPE", "multi-label")
-DEFAULT_THRESHOLD = float(os.getenv("GLICLASS_THRESHOLD", "0.5"))
-DEFAULT_MAX_LENGTH = int(os.getenv("GLICLASS_MAX_LENGTH", "2048"))
-# GLiClass (uni-encoder) packs every label into one forward pass and is trained
-# around ~25 classes; scoring all ~94 Dewey labels at once makes the model ignore
-# the text and return a near-constant ranking. The chunking pipeline scores the
-# labels in small batches (each with the full text) and max-pools, keeping every
-# pass in-distribution. Tune the batch size via GLICLASS_LABELS_CHUNK_SIZE.
-DEFAULT_LABELS_CHUNK_SIZE = int(os.getenv("GLICLASS_LABELS_CHUNK_SIZE", "8"))
-# Two-stage routing. GLiClass discriminates well among a handful of labels but
-# collapses (constant, over-confident ranking) when scoring the full ~94-class
-# Dewey taxonomy at once. When the taxonomy is larger than TWO_STAGE_MIN_LABELS
-# and Dewey-structured (a `X00` main-class entry exists for every group), we first
-# rank the 10 main classes, keep the STAGE1_TOP_K best, then classify only their
-# subdivisions -- so the model never weighs more than ~10-20 labels in one pass.
-TWO_STAGE_MIN_LABELS = int(os.getenv("GLICLASS_TWO_STAGE_MIN_LABELS", "25"))
-STAGE1_TOP_K = int(os.getenv("GLICLASS_STAGE1_TOP_K", "2"))
-# The bare `X00` main-class labels ("Géographie et histoire", "Sciences de la
-# nature et mathématiques", ...) are broad catch-alls that the model scores high
-# on almost any text, so they drown out the specific subdivision that should win.
-# By default they are dropped from the stage-2 candidates (they still drive the
-# stage-1 area selection), forcing a specific class. Set to true to keep them.
-STAGE2_INCLUDE_PARENT = os.getenv(
-    "GLICLASS_STAGE2_INCLUDE_PARENT", "false"
-).strip().lower() in {"1", "true", "yes", "on"}
-API_KEY = os.getenv("CLASSIFICATION_API_KEY", os.getenv("API_KEY", ""))
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-large")
+EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cpu")
+# e5 / bge models are trained with asymmetric prefixes; the search text is a
+# "query" and the class descriptions / examples are "passages". Override (e.g. to
+# empty strings) for models that don't use prefixes.
+QUERY_PREFIX = os.getenv("EMBEDDING_QUERY_PREFIX", "query: ")
+PASSAGE_PREFIX = os.getenv("EMBEDDING_PASSAGE_PREFIX", "passage: ")
 
-# Default labels are the Dewey divisions (main classes and their hundred-level
-# subdivisions). Clients normally post their own `labels` list (discipline label
-# + Dewey code); this default only keeps the endpoint usable without an explicit
-# taxonomy.
-DEFAULT_LABELS: list[dict[str, str]] = [
-    {"000": "Informatique, information, généralités"},
-    {"004": "Informatique"},
-    {"020": "Bibliothéconomie et sciences de l'information"},
-    {"060": "Organisations générales et muséologie"},
-    {"070": "Médias d'information, journalisme, édition"},
-    {"090": "Manuscrits et livres rares"},
-    {"100": "Philosophie, psychologie"},
-    {"110": "Métaphysique"},
-    {"120": "Epistémologie, causalité, genre humain"},
-    {"130": "Phénomènes paranormaux, pseudosciences"},
-    {"140": "Les divers systèmes et écoles philosophiques"},
-    {"150": "Psychologie"},
-    {"160": "Logique"},
-    {"170": "Morale (éthique)"},
-    {"180": "Philosophie de l'Antiquité, du Moyen Âge, de l'Orient"},
-    {"190": "Philosophie occidentale moderne et philosophies non orientales"},
-    {"200": "Religion"},
-    {"210": "Philosophie et théorie de la religion"},
-    {"220": "Bible"},
-    {"230": "Théologie chrétienne"},
-    {"240": "Théologie morale et pratiques chrétiennes"},
-    {"250": "Eglises locales, ordres religieux chrétiens"},
-    {"260": "Théologie chrétienne et société, ecclésiologie"},
-    {"270": "Histoire et géographie du christianisme et de l'Eglise chrétienne"},
-    {"280": "Confessions et sectes de l'Eglise chrétienne"},
-    {"290": "Autres religions"},
-    {"300": "Sciences sociales, sociologie, anthropologie"},
-    {"310": "Statistiques générales"},
-    {"320": "Science politique"},
-    {"330": "Economie"},
-    {"340": "Droit"},
-    {"350": "Administration publique. Arts et science militaires"},
-    {"360": "Problèmes et services sociaux"},
-    {"370": "Education et enseignement"},
-    {"380": "Commerce, communications, transports"},
-    {"390": "Ethnologie"},
-    {"400": "Langues et linguistique"},
-    {"410": "Linguistique générale"},
-    {"420": "Langue anglaise. Anglo-saxon"},
-    {"430": "Langues germaniques. Allemand"},
-    {"440": "Langues romanes. Français"},
-    {"450": "Langues italienne, roumaine, rhéto-romane"},
-    {"460": "Langues espagnole et portugaise"},
-    {"470": "Langues italiques. Latin"},
-    {"480": "Langues helléniques. Grec classique"},
-    {"490": "Autres langues"},
-    {"500": "Sciences de la nature et mathématiques"},
-    {"510": "Mathématiques"},
-    {"520": "Astronomie, cartographie, géodésie"},
-    {"530": "Physique"},
-    {"540": "Chimie, minéralogie, cristallographie"},
-    {"550": "Sciences de la terre"},
-    {"560": "Paléontologie. Paléozoologie"},
-    {"570": "Sciences de la vie, biologie, biochimie"},
-    {"580": "Plantes. Botanique"},
-    {"590": "Animaux. Zoologie"},
-    {"600": "Technologie (Sciences appliquées)"},
-    {"610": "Médecine et santé"},
-    {"620": "Sciences de l'ingénieur"},
-    {"630": "Agronomie, agriculture et médecine vétérinaire"},
-    {"640": "Economie domestique. Vie familiale"},
-    {"650": "Gestion et organisation de l'entreprise"},
-    {"660": "Génie chimique, technologies alimentaires"},
-    {"670": "Fabrication industrielle"},
-    {"680": "Fabrication de produits à usages spécifiques"},
-    {"690": "Bâtiments"},
-    {"700": "Arts. Beaux-arts et arts décoratifs"},
-    {"710": "Urbanisme"},
-    {"720": "Architecture"},
-    {"730": "Arts plastiques. Sculpture"},
-    {"740": "Dessin. Arts décoratifs"},
-    {"750": "Peinture"},
-    {"760": "Arts graphiques"},
-    {"770": "Photographie et les photographies, art numérique"},
-    {"780": "Musique"},
-    {"790": "Arts du spectacle, loisirs"},
-    {"796": "Sport"},
-    {"800": "Histoire et critique littéraires, rhétorique"},
-    {"810": "Littérature américaine en anglais"},
-    {"820": "Littératures anglaise et anglo-saxonne"},
-    {"830": "Littérature allemande"},
-    {"840": "Littérature de langues romanes. Littérature française"},
-    {"850": "Littérature italienne"},
-    {"860": "Littératures espagnole et portugaise"},
-    {"870": "Littérature latine"},
-    {"880": "Littérature grecque"},
-    {"890": "Littératures des autres langues"},
-    {"900": "Géographie et histoire"},
-    {"910": "Géographie et voyages"},
-    {"920": "Biographies générales, généalogie, emblèmes"},
-    {"930": "Histoire ancienne et préhistoire"},
-    {"940": "Histoire moderne et contemporaine de l'Europe"},
-    {"944": "Histoire générale de la France"},
-    {"950": "Histoire générale de l'Asie, Orient, Extrême-Orient"},
-    {"960": "Histoire générale de l'Afrique"},
-    {"970": "Histoire générale de l'Amérique du Nord"},
-    {"980": "Histoire générale de l'Amérique du Sud"},
-    {"990": "Histoire générale des autres parties du monde, des mondes extraterrestres. Iles du Pacifique"},
-]
+TAXONOMY_PATH = os.getenv("TAXONOMY_PATH", str(Path(__file__).parent / "taxonomy.json"))
+# Optional JSON file of catalogued examples for k-NN: [{"text": ..., "code": ...}].
+EXAMPLES_PATH = os.getenv("EXAMPLES_PATH", "")
+# Weight applied to the best matching example's similarity when blending it with
+# the class-description similarity (final = max(desc_sim, weight * example_sim)).
+EXAMPLE_WEIGHT = float(os.getenv("EMBEDDING_EXAMPLE_WEIGHT", "1.0"))
+
+DEFAULT_TOP_K = int(os.getenv("CLASSIFICATION_TOP_K", "5"))
+DEFAULT_THRESHOLD = float(os.getenv("CLASSIFICATION_THRESHOLD", "0.0"))
+DEFAULT_CLASSIFICATION_TYPE = os.getenv("CLASSIFICATION_TYPE", "multi-label")
+API_KEY = os.getenv("CLASSIFICATION_API_KEY", os.getenv("API_KEY", ""))
 
 
 app = FastAPI(
     title="Humatheque Classification API",
-    version="0.1.0",
+    version="0.2.0",
     description=(
-        "Zero-shot classification of academic text against a Dewey taxonomy using the "
-        "GLiClass `gliclass-modern-large-v3.0` model. Clients post the text and a list "
-        "of `{dewey_code: discipline_label}` entries; only the discipline labels are "
-        "sent to the model, and the response re-attaches the matching Dewey code to "
-        "each scored class."
+        "Local Dewey classification of academic text by semantic similarity. The "
+        "text is embedded with a multilingual sentence-embedding model and ranked "
+        "against the Dewey taxonomy, where each class is described by its "
+        "authoritative label plus curated keywords. Returns the matching classes "
+        "as `dewey` + `label` + `score` (cosine similarity)."
     ),
 )
 
@@ -172,9 +68,9 @@ def require_api_key(api_key: str | None = Security(api_key_header)) -> None:
 
 
 class LabelScore(BaseModel):
-    dewey: str | None = Field(None, description="Dewey code mapped back from the label.")
-    label: str = Field(..., description="Discipline label scored by the model.")
-    score: float = Field(..., description="Model confidence for the label.")
+    dewey: str | None = Field(None, description="Dewey code of the matched class.")
+    label: str = Field(..., description="Authoritative Dewey discipline label.")
+    score: float = Field(..., description="Cosine similarity of the text to the class.")
 
 
 class TextClassification(BaseModel):
@@ -187,24 +83,28 @@ class ClassifyRequest(BaseModel):
         ...,
         description="Text to classify, or a list of texts for batch classification.",
     )
-    labels: list[dict[str, str]] = Field(
-        default_factory=lambda: list(DEFAULT_LABELS),
+    codes: list[str] | None = Field(
+        None,
         description=(
-            "Candidate labels as a list of single-entry dicts mapping a Dewey code to "
-            "its discipline label, for example [{'004': 'Informatique'}]. Only the "
-            "label text is sent to the model; the Dewey code is re-attached in the "
-            "response."
+            "Optional subset of Dewey codes to restrict the candidate classes to "
+            "(e.g. ['004', '510']). Defaults to the full taxonomy. Unknown codes "
+            "are ignored."
         ),
     )
-    threshold: float = Field(DEFAULT_THRESHOLD, ge=0.0, le=1.0)
+    threshold: float = Field(
+        DEFAULT_THRESHOLD,
+        ge=-1.0,
+        le=1.0,
+        description="Minimum cosine similarity for a class to be returned.",
+    )
     classification_type: str = Field(
         DEFAULT_CLASSIFICATION_TYPE,
-        description="`multi-label` or `single-label`.",
+        description="`multi-label` returns up to top_k classes; `single-label` returns the best one.",
     )
     top_k: int | None = Field(
         None,
         ge=1,
-        description="Optional cap on the number of returned classes per text.",
+        description="Cap on the number of returned classes per text (default from env).",
     )
 
 
@@ -217,178 +117,87 @@ class ClassifyResponse(BaseModel):
     results: list[TextClassification]
 
 
-def torch_dtype(name: str) -> Any:
-    import torch
+class Classifier:
+    """Embeds the taxonomy (and optional examples) once and ranks texts against it."""
 
-    mapping = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    if name not in mapping:
-        raise HTTPException(status_code=500, detail=f"Unsupported GLICLASS_DTYPE {name!r}.")
-    return mapping[name]
+    def __init__(self, model: Any, entries: list[dict[str, str]], examples: list[dict[str, str]]):
+        import numpy as np
 
+        self.model = model
+        self.codes = [e["code"] for e in entries]
+        self.labels = [e["label"] for e in entries]
+        self.code_to_label = {e["code"]: e["label"] for e in entries}
+        self.code_to_row = {code: i for i, code in enumerate(self.codes)}
 
-@lru_cache(maxsize=4)
-def get_pipeline(classification_type: str) -> Any:
-    """Build and cache a GLiClass pipeline per classification type.
+        passages = [f"{PASSAGE_PREFIX}{e['label']}. {e.get('description', '')}".strip() for e in entries]
+        self.class_emb = self._encode(passages)
 
-    The model and tokenizer are heavy to load, so each (model, classification_type)
-    pipeline is memoized and reused across requests.
-    """
-    from gliclass import GLiClassModel, ZeroShotClassificationWithChunkingPipeline
-    from transformers import AutoTokenizer
+        # Optional catalogued examples for k-NN: one embedding per example, grouped
+        # by the Dewey code it was assigned. Empty unless EXAMPLES_PATH is set.
+        self.example_rows: dict[str, Any] = {}
+        valid = [ex for ex in examples if ex.get("text") and ex.get("code") in self.code_to_row]
+        if valid:
+            ex_emb = self._encode([f"{PASSAGE_PREFIX}{ex['text']}" for ex in valid])
+            by_code: dict[str, list[Any]] = {}
+            for ex, vec in zip(valid, ex_emb):
+                by_code.setdefault(ex["code"], []).append(vec)
+            self.example_rows = {code: np.vstack(vecs) for code, vecs in by_code.items()}
 
-    model = GLiClassModel.from_pretrained(GLICLASS_MODEL, dtype=torch_dtype(GLICLASS_DTYPE))
-    tokenizer = AutoTokenizer.from_pretrained(GLICLASS_MODEL)
-    return ZeroShotClassificationWithChunkingPipeline(
-        model,
-        tokenizer,
-        classification_type=classification_type,
-        device=GLICLASS_DEVICE,
-        max_length=DEFAULT_MAX_LENGTH,
-        labels_chunk_size=DEFAULT_LABELS_CHUNK_SIZE,
-        progress_bar=False,
-    )
-
-
-def parse_labels(labels: list[dict[str, str]]) -> tuple[list[str], dict[str, list[str]]]:
-    """Split the `{code: label}` entries into model labels and a label->codes map.
-
-    Only the discipline label text is given to the model. The label->codes mapping
-    lets the response re-attach the Dewey code(s) to each scored label. Duplicate
-    label texts (same discipline under several codes) keep every code.
-    """
-    ordered_labels: list[str] = []
-    label_to_codes: dict[str, list[str]] = {}
-    for entry in labels:
-        for code, label in entry.items():
-            label = str(label).strip()
-            code = str(code).strip()
-            if not label:
-                continue
-            if label not in label_to_codes:
-                label_to_codes[label] = []
-                ordered_labels.append(label)
-            if code and code not in label_to_codes[label]:
-                label_to_codes[label].append(code)
-    if not ordered_labels:
-        raise HTTPException(status_code=400, detail="No usable labels provided.")
-    return ordered_labels, label_to_codes
-
-
-def to_label_scores(
-    raw_results: list[dict[str, Any]],
-    label_to_codes: dict[str, list[str]],
-    top_k: int | None,
-) -> list[LabelScore]:
-    scored: list[LabelScore] = []
-    for result in raw_results:
-        label = str(result.get("label", ""))
-        score = float(result.get("score", 0.0))
-        codes = label_to_codes.get(label) or [None]
-        for code in codes:
-            scored.append(LabelScore(dewey=code, label=label, score=round(score, 4)))
-    scored.sort(key=lambda item: item.score, reverse=True)
-    if top_k is not None:
-        scored = scored[:top_k]
-    return scored
-
-
-def main_class_code(code: str) -> str:
-    """Dewey main class for a code: first digit padded to `X00` (e.g. 944 -> 900)."""
-    digit = code.strip()[:1] or "0"
-    return f"{digit}00"
-
-
-def split_taxonomy(
-    labels: list[dict[str, str]],
-) -> tuple[list[dict[str, str]], dict[str, list[dict[str, str]]]] | None:
-    """Group `{code: label}` entries by Dewey main class for two-stage routing.
-
-    Returns `(main_labels, subdivisions)` where `main_labels` is the list of the
-    `X00` entries and `subdivisions` maps each main code to its member entries
-    (the main entry included). Returns `None` when the taxonomy is not usable for
-    two-stage routing -- too small, or some group has no `X00` main entry -- so the
-    caller falls back to a single flat pass.
-    """
-    subdivisions: dict[str, list[dict[str, str]]] = {}
-    main_entry: dict[str, dict[str, str]] = {}
-    for entry in labels:
-        for code, label in entry.items():
-            code = str(code).strip()
-            if not str(label).strip():
-                continue
-            main = main_class_code(code)
-            subdivisions.setdefault(main, []).append({code: label})
-            if code == main:
-                main_entry[main] = {code: label}
-
-    if len(labels) <= TWO_STAGE_MIN_LABELS:
-        return None
-    if any(main not in main_entry for main in subdivisions):
-        return None  # not cleanly Dewey-structured; flat pass is safer
-
-    main_labels = [main_entry[main] for main in sorted(subdivisions)]
-    return main_labels, subdivisions
-
-
-def classify_flat(
-    texts: list[str],
-    labels: list[dict[str, str]],
-    classification_type: str,
-    threshold: float,
-    top_k: int | None,
-) -> list[TextClassification]:
-    """Single-pass classification of every text against one shared label set."""
-    ordered_labels, label_to_codes = parse_labels(labels)
-    pipeline = get_pipeline(classification_type)
-    raw_batches = pipeline(texts, ordered_labels, threshold=threshold)
-    return [
-        TextClassification(text=text, classes=to_label_scores(raw, label_to_codes, top_k))
-        for text, raw in zip(texts, raw_batches)
-    ]
-
-
-def classify_two_stage(
-    texts: list[str],
-    main_labels: list[dict[str, str]],
-    subdivisions: dict[str, list[dict[str, str]]],
-    classification_type: str,
-    threshold: float,
-    top_k: int | None,
-) -> list[TextClassification]:
-    """Rank the Dewey main classes, then classify within the top STAGE1_TOP_K.
-
-    Stage 1 scores all main classes (threshold 0, so every main is ranked) and
-    keeps the STAGE1_TOP_K best per text. Stage 2 classifies each text against
-    only the subdivisions of its selected main classes, honouring the caller's
-    classification type / threshold / top_k. Stage 2 label sets differ per text,
-    so each text is run on its own.
-    """
-    main_ordered, main_to_codes = parse_labels(main_labels)
-    stage1 = get_pipeline("multi-label")(texts, main_ordered, threshold=0.0)
-
-    results: list[TextClassification] = []
-    for text, raw in zip(texts, stage1):
-        ranked = sorted(raw, key=lambda r: r.get("score", 0.0), reverse=True)
-        chosen_mains = {
-            main_to_codes[str(r["label"])][0]
-            for r in ranked[:STAGE1_TOP_K]
-            if main_to_codes.get(str(r["label"]))
-        }
-        sub_labels: list[dict[str, str]] = []
-        for main in chosen_mains:
-            group = subdivisions.get(main, [])
-            # Drop the broad parent label unless it is the group's only entry.
-            if not STAGE2_INCLUDE_PARENT and len(group) > 1:
-                group = [entry for entry in group if next(iter(entry)) != main]
-            sub_labels.extend(group)
-        results.extend(
-            classify_flat([text], sub_labels, classification_type, threshold, top_k)
+    def _encode(self, texts: list[str]) -> Any:
+        return self.model.encode(
+            texts, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False
         )
-    return results
+
+    def rank(
+        self, text: str, codes: list[str] | None, threshold: float, top_k: int
+    ) -> list[LabelScore]:
+        import numpy as np
+
+        query = self._encode([f"{QUERY_PREFIX}{text}"])[0]
+        desc_sims = self.class_emb @ query  # cosine, embeddings are normalized
+
+        candidate_rows = range(len(self.codes))
+        if codes:
+            candidate_rows = [self.code_to_row[c] for c in codes if c in self.code_to_row]
+            if not candidate_rows:
+                raise HTTPException(status_code=400, detail="No known Dewey codes provided.")
+
+        scored: list[LabelScore] = []
+        for row in candidate_rows:
+            code = self.codes[row]
+            score = float(desc_sims[row])
+            ex = self.example_rows.get(code)
+            if ex is not None:
+                score = max(score, EXAMPLE_WEIGHT * float((ex @ query).max()))
+            scored.append(LabelScore(dewey=code, label=self.labels[row], score=round(score, 4)))
+
+        scored.sort(key=lambda item: item.score, reverse=True)
+        scored = [s for s in scored if s.score >= threshold]
+        return scored[:top_k]
+
+
+def load_taxonomy() -> list[dict[str, str]]:
+    with open(TAXONOMY_PATH, encoding="utf-8") as fh:
+        entries = json.load(fh)
+    if not entries:
+        raise RuntimeError(f"Taxonomy at {TAXONOMY_PATH!r} is empty.")
+    return entries
+
+
+def load_examples() -> list[dict[str, str]]:
+    if not EXAMPLES_PATH or not Path(EXAMPLES_PATH).exists():
+        return []
+    with open(EXAMPLES_PATH, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+@lru_cache(maxsize=1)
+def get_classifier() -> Classifier:
+    """Load the embedding model and build the taxonomy index once per process."""
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(EMBEDDING_MODEL, device=EMBEDDING_DEVICE)
+    return Classifier(model, load_taxonomy(), load_examples())
 
 
 def classify(payload: ClassifyRequest) -> dict[str, Any]:
@@ -396,22 +205,20 @@ def classify(payload: ClassifyRequest) -> dict[str, Any]:
     if not texts or all(not text.strip() for text in texts):
         raise HTTPException(status_code=400, detail="Provide non-empty text.")
 
-    split = split_taxonomy(payload.labels)
-    if split is None:
-        results = classify_flat(
-            texts, payload.labels, payload.classification_type,
-            payload.threshold, payload.top_k,
+    top_k = 1 if payload.classification_type == "single-label" else (payload.top_k or DEFAULT_TOP_K)
+    classifier = get_classifier()
+
+    results = [
+        TextClassification(
+            text=text,
+            classes=classifier.rank(text, payload.codes, payload.threshold, top_k),
         )
-    else:
-        main_labels, subdivisions = split
-        results = classify_two_stage(
-            texts, main_labels, subdivisions, payload.classification_type,
-            payload.threshold, payload.top_k,
-        )
+        for text in texts
+    ]
 
     return {
-        "source": "gliclass_classification",
-        "model": GLICLASS_MODEL,
+        "source": "embedding_classification",
+        "model": EMBEDDING_MODEL,
         "classification_type": payload.classification_type,
         "threshold": payload.threshold,
         "count": len(results),
