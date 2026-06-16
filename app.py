@@ -71,6 +71,8 @@ ALBERT_PASSAGE_PREFIX = os.getenv("ALBERT_PASSAGE_PREFIX", "")
 ALBERT_TIMEOUT = float(os.getenv("ALBERT_TIMEOUT", "30"))
 # Size of the bi-encoder candidate pool handed to the cross-encoder reranker.
 RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "20"))
+# Max inputs per /embeddings request. Albert caps a batch at 64; larger trips 413.
+ALBERT_EMBED_BATCH = int(os.getenv("ALBERT_EMBED_BATCH", "64"))
 
 
 app = FastAPI(
@@ -262,8 +264,8 @@ class AlbertClassifier(_Index):
         import numpy as np
 
         vectors: list[list[float]] = []
-        for start in range(0, len(texts), 96):
-            batch = texts[start : start + 96]
+        for start in range(0, len(texts), ALBERT_EMBED_BATCH):
+            batch = texts[start : start + ALBERT_EMBED_BATCH]
             payload = _albert_post("/embeddings", {"model": ALBERT_EMBEDDING_MODEL, "input": batch})
             data = sorted(payload["data"], key=lambda d: d["index"])
             vectors.extend(d["embedding"] for d in data)
