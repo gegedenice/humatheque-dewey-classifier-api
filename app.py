@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
+
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-large")
 EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cpu")
 # Optional Hugging Face access token, used to download the embedding model
@@ -47,6 +48,29 @@ DEFAULT_TOP_K = int(os.getenv("CLASSIFICATION_TOP_K", "5"))
 DEFAULT_THRESHOLD = float(os.getenv("CLASSIFICATION_THRESHOLD", "0.0"))
 DEFAULT_CLASSIFICATION_TYPE = os.getenv("CLASSIFICATION_TYPE", "multi-label")
 API_KEY = os.getenv("CLASSIFICATION_API_KEY", os.getenv("API_KEY", ""))
+
+# --- Method selection -------------------------------------------------------
+# Two interchangeable strategies, chosen per request via `method`:
+#   "local"  -> local bi-encoder only (EMBEDDING_MODEL, e.g. multilingual-e5-large)
+#   "albert" -> remote bi-encoder retrieval (Albert API, BAAI/bge-m3) to build a
+#               candidate pool, then a remote cross-encoder rerank
+#               (BAAI/bge-reranker-v2-m3) to reorder it.
+METHOD_LOCAL = "local"
+METHOD_ALBERT = "albert"
+VALID_METHODS = (METHOD_LOCAL, METHOD_ALBERT)
+DEFAULT_METHOD = os.getenv("CLASSIFICATION_METHOD", METHOD_LOCAL).lower()
+
+# --- Albert API (https://albert.api.etalab.gouv.fr) -------------------------
+ALBERT_API_KEY = os.getenv("ALBERT_API_KEY", "")
+ALBERT_BASE_URL = os.getenv("ALBERT_BASE_URL", "https://albert.api.etalab.gouv.fr/v1").rstrip("/")
+ALBERT_EMBEDDING_MODEL = os.getenv("ALBERT_EMBEDDING_MODEL", "BAAI/bge-m3")
+ALBERT_RERANK_MODEL = os.getenv("ALBERT_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+# bge-m3 is symmetric and uses no query/passage prefixes; override if needed.
+ALBERT_QUERY_PREFIX = os.getenv("ALBERT_QUERY_PREFIX", "")
+ALBERT_PASSAGE_PREFIX = os.getenv("ALBERT_PASSAGE_PREFIX", "")
+ALBERT_TIMEOUT = float(os.getenv("ALBERT_TIMEOUT", "30"))
+# Size of the bi-encoder candidate pool handed to the cross-encoder reranker.
+RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "20"))
 
 
 app = FastAPI(
@@ -108,10 +132,19 @@ class ClassifyRequest(BaseModel):
         ge=1,
         description="Cap on the number of returned classes per text (default from env).",
     )
+    method: str = Field(
+        DEFAULT_METHOD,
+        description=(
+            "Classification strategy. `local`: local bi-encoder embeddings "
+            "(multilingual-e5-large) only. `albert`: Albert API bge-m3 retrieval "
+            "+ bge-reranker-v2-m3 cross-encoder rerank (requires ALBERT_API_KEY)."
+        ),
+    )
 
 
 class ClassifyResponse(BaseModel):
     source: str
+    method: str
     model: str
     classification_type: str
     threshold: float
@@ -119,63 +152,175 @@ class ClassifyResponse(BaseModel):
     results: list[TextClassification]
 
 
-class Classifier:
-    """Embeds the taxonomy (and optional examples) once and ranks texts against it."""
+class _Index:
+    """Bi-encoder index over the taxonomy (and optional examples).
 
-    def __init__(self, model: Any, entries: list[dict[str, str]], examples: list[dict[str, str]]):
+    Subclasses provide the embedding backend (`_encode_passages` / `_encode_queries`)
+    and the per-text prefixes. `_retrieve` returns candidate `(row, similarity)`
+    pairs sorted by descending bi-encoder similarity; subclasses turn those into the
+    final `LabelScore` ranking (the local one directly, the Albert one after a
+    cross-encoder rerank).
+    """
+
+    query_prefix = ""
+    passage_prefix = ""
+
+    def __init__(self, entries: list[dict[str, str]], examples: list[dict[str, str]]):
         import numpy as np
 
-        self.model = model
         self.codes = [e["code"] for e in entries]
         self.labels = [e["label"] for e in entries]
         self.code_to_label = {e["code"]: e["label"] for e in entries}
         self.code_to_row = {code: i for i, code in enumerate(self.codes)}
-
-        passages = [f"{PASSAGE_PREFIX}{e['label']}. {e.get('description', '')}".strip() for e in entries]
-        self.class_emb = self._encode(passages)
+        # Enriched class text: authoritative label + curated keywords. Reused as the
+        # bi-encoder passage and as the document handed to the cross-encoder.
+        self.descriptions = [f"{e['label']}. {e.get('description', '')}".strip() for e in entries]
+        self.class_emb = self._encode_passages([self.passage_prefix + d for d in self.descriptions])
 
         # Optional catalogued examples for k-NN: one embedding per example, grouped
         # by the Dewey code it was assigned. Empty unless EXAMPLES_PATH is set.
         self.example_rows: dict[str, Any] = {}
         valid = [ex for ex in examples if ex.get("text") and ex.get("code") in self.code_to_row]
         if valid:
-            ex_emb = self._encode([f"{PASSAGE_PREFIX}{ex['text']}" for ex in valid])
+            ex_emb = self._encode_passages([self.passage_prefix + ex["text"] for ex in valid])
             by_code: dict[str, list[Any]] = {}
             for ex, vec in zip(valid, ex_emb):
                 by_code.setdefault(ex["code"], []).append(vec)
             self.example_rows = {code: np.vstack(vecs) for code, vecs in by_code.items()}
 
-    def _encode(self, texts: list[str]) -> Any:
-        return self.model.encode(
-            texts, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False
-        )
+    # --- embedding backend (implemented by subclasses) ---------------------
+    def _encode_passages(self, texts: list[str]) -> Any:
+        raise NotImplementedError
 
-    def rank(
-        self, text: str, codes: list[str] | None, threshold: float, top_k: int
-    ) -> list[LabelScore]:
-        import numpy as np
+    def _encode_queries(self, texts: list[str]) -> Any:
+        raise NotImplementedError
 
-        query = self._encode([f"{QUERY_PREFIX}{text}"])[0]
+    def _retrieve(self, text: str, codes: list[str] | None) -> list[tuple[int, float]]:
+        query = self._encode_queries([self.query_prefix + text])[0]
         desc_sims = self.class_emb @ query  # cosine, embeddings are normalized
 
-        candidate_rows = range(len(self.codes))
+        candidate_rows: Any = range(len(self.codes))
         if codes:
             candidate_rows = [self.code_to_row[c] for c in codes if c in self.code_to_row]
             if not candidate_rows:
                 raise HTTPException(status_code=400, detail="No known Dewey codes provided.")
 
-        scored: list[LabelScore] = []
+        scored: list[tuple[int, float]] = []
         for row in candidate_rows:
-            code = self.codes[row]
             score = float(desc_sims[row])
-            ex = self.example_rows.get(code)
+            ex = self.example_rows.get(self.codes[row])
             if ex is not None:
                 score = max(score, EXAMPLE_WEIGHT * float((ex @ query).max()))
-            scored.append(LabelScore(dewey=code, label=self.labels[row], score=round(score, 4)))
+            scored.append((row, score))
 
-        scored.sort(key=lambda item: item.score, reverse=True)
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored
+
+
+class LocalClassifier(_Index):
+    """Local bi-encoder only: rank every class by cosine similarity."""
+
+    query_prefix = QUERY_PREFIX
+    passage_prefix = PASSAGE_PREFIX
+
+    def __init__(self, model: Any, entries: list[dict[str, str]], examples: list[dict[str, str]]):
+        self.model = model
+        super().__init__(entries, examples)
+
+    def _encode_passages(self, texts: list[str]) -> Any:
+        return self.model.encode(
+            texts, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False
+        )
+
+    _encode_queries = _encode_passages
+
+    def rank(
+        self, text: str, codes: list[str] | None, threshold: float, top_k: int
+    ) -> list[LabelScore]:
+        ranked = self._retrieve(text, codes)
+        scored = [
+            LabelScore(dewey=self.codes[row], label=self.labels[row], score=round(score, 4))
+            for row, score in ranked
+        ]
         scored = [s for s in scored if s.score >= threshold]
         return scored[:top_k]
+
+
+class AlbertClassifier(_Index):
+    """Albert API: bi-encoder (bge-m3) retrieval, then cross-encoder rerank.
+
+    The bi-encoder narrows the taxonomy to a `RERANK_CANDIDATES`-sized pool; the
+    cross-encoder (bge-reranker-v2-m3) then scores each candidate's enriched
+    description against the query. Returned scores are reranker relevance scores,
+    not cosine similarities.
+    """
+
+    query_prefix = ALBERT_QUERY_PREFIX
+    passage_prefix = ALBERT_PASSAGE_PREFIX
+
+    def _embed(self, texts: list[str]) -> Any:
+        import numpy as np
+
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), 96):
+            batch = texts[start : start + 96]
+            payload = _albert_post("/embeddings", {"model": ALBERT_EMBEDDING_MODEL, "input": batch})
+            data = sorted(payload["data"], key=lambda d: d["index"])
+            vectors.extend(d["embedding"] for d in data)
+        arr = np.asarray(vectors, dtype="float32")
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return arr / norms  # L2-normalized, so the dot product is cosine similarity
+
+    _encode_passages = _embed
+    _encode_queries = _embed
+
+    def rank(
+        self, text: str, codes: list[str] | None, threshold: float, top_k: int
+    ) -> list[LabelScore]:
+        ranked = self._retrieve(text, codes)
+        pool = ranked[: max(top_k, RERANK_CANDIDATES)]
+        if not pool:
+            return []
+
+        documents = [self.descriptions[row] for row, _ in pool]
+        payload = _albert_post(
+            "/rerank",
+            {"model": ALBERT_RERANK_MODEL, "query": text, "documents": documents},
+        )
+        results = sorted(
+            payload["results"], key=lambda r: r["relevance_score"], reverse=True
+        )
+
+        scored = []
+        for r in results:
+            row = pool[r["index"]][0]
+            score = round(float(r["relevance_score"]), 4)
+            scored.append(LabelScore(dewey=self.codes[row], label=self.labels[row], score=score))
+        scored = [s for s in scored if s.score >= threshold]
+        return scored[:top_k]
+
+
+def _albert_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    """POST to the Albert API and return the parsed JSON, mapping failures to HTTP errors."""
+    import httpx
+
+    if not ALBERT_API_KEY:
+        raise HTTPException(
+            status_code=503, detail="ALBERT_API_KEY is not configured for the 'albert' method."
+        )
+    headers = {"Authorization": f"Bearer {ALBERT_API_KEY}"}
+    try:
+        resp = httpx.post(f"{ALBERT_BASE_URL}{path}", json=body, headers=headers, timeout=ALBERT_TIMEOUT)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Albert API error ({exc.response.status_code}): {exc.response.text[:200]}",
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Albert API request failed: {exc}")
+    return resp.json()
 
 
 def load_taxonomy() -> list[dict[str, str]]:
@@ -193,13 +338,20 @@ def load_examples() -> list[dict[str, str]]:
         return json.load(fh)
 
 
-@lru_cache(maxsize=1)
-def get_classifier() -> Classifier:
-    """Load the embedding model and build the taxonomy index once per process."""
+@lru_cache(maxsize=len(VALID_METHODS))
+def get_classifier(method: str) -> _Index:
+    """Build the taxonomy index for `method` once per process (cached per method)."""
+    if method == METHOD_ALBERT:
+        if not ALBERT_API_KEY:
+            raise HTTPException(
+                status_code=503, detail="ALBERT_API_KEY is not configured for the 'albert' method."
+            )
+        return AlbertClassifier(load_taxonomy(), load_examples())
+
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(EMBEDDING_MODEL, device=EMBEDDING_DEVICE, token=HF_TOKEN)
-    return Classifier(model, load_taxonomy(), load_examples())
+    return LocalClassifier(model, load_taxonomy(), load_examples())
 
 
 def classify(payload: ClassifyRequest) -> dict[str, Any]:
@@ -207,8 +359,14 @@ def classify(payload: ClassifyRequest) -> dict[str, Any]:
     if not texts or all(not text.strip() for text in texts):
         raise HTTPException(status_code=400, detail="Provide non-empty text.")
 
+    method = (payload.method or DEFAULT_METHOD).lower()
+    if method not in VALID_METHODS:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown method {method!r}; expected one of {list(VALID_METHODS)}."
+        )
+
     top_k = 1 if payload.classification_type == "single-label" else (payload.top_k or DEFAULT_TOP_K)
-    classifier = get_classifier()
+    classifier = get_classifier(method)
 
     results = [
         TextClassification(
@@ -218,9 +376,17 @@ def classify(payload: ClassifyRequest) -> dict[str, Any]:
         for text in texts
     ]
 
+    if method == METHOD_ALBERT:
+        source = "albert_rerank_classification"
+        model_name = f"{ALBERT_EMBEDDING_MODEL} + {ALBERT_RERANK_MODEL}"
+    else:
+        source = "embedding_classification"
+        model_name = EMBEDDING_MODEL
+
     return {
-        "source": "embedding_classification",
-        "model": EMBEDDING_MODEL,
+        "source": source,
+        "method": method,
+        "model": model_name,
         "classification_type": payload.classification_type,
         "threshold": payload.threshold,
         "count": len(results),

@@ -44,6 +44,27 @@ can do it without touching Python.
 `multi-label` (default) returns up to `top_k` classes; `single-label` returns the
 single best class.
 
+### Classification methods
+
+The strategy is chosen per request with the `method` field (default
+`CLASSIFICATION_METHOD`):
+
+- **`local`** (default) — the local bi-encoder above. Fully offline, ranks the
+  whole taxonomy by cosine similarity. No external calls.
+- **`albert`** — a two-stage *retrieve-then-rerank* pipeline served by the
+  [Albert API](https://albert.api.etalab.gouv.fr) (the French government's
+  sovereign LLM gateway). A remote **bi-encoder** (`BAAI/bge-m3`) narrows the
+  taxonomy to a candidate pool of `RERANK_CANDIDATES`, then a remote
+  **cross-encoder** (`BAAI/bge-reranker-v2-m3`) re-scores each candidate's
+  enriched description against the text. Cross-encoders read query and document
+  *together*, so the reranked order is usually sharper than bi-encoder cosine
+  alone. Requires `ALBERT_API_KEY`.
+
+Both methods use the same `taxonomy.json` and the same k-NN examples, so enriching
+descriptions improves both. Note that `albert` returns **reranker relevance
+scores**, not cosine similarities, so the numbers are not comparable across
+methods.
+
 ### Model
 
 The default model is
@@ -95,7 +116,8 @@ Request body:
   "codes": null,
   "threshold": 0.0,
   "classification_type": "multi-label",
-  "top_k": 5
+  "top_k": 5,
+  "method": "local"
 }
 ```
 
@@ -103,9 +125,10 @@ Request body:
 |---|---:|---|
 | `text` | yes | A string, or a list of strings for batch classification |
 | `codes` | no | Optional subset of Dewey codes to restrict candidates to (e.g. `["004","510"]`); defaults to the full taxonomy. Unknown codes are ignored |
-| `threshold` | no | Minimum cosine similarity to return a class, default `0.0` |
+| `threshold` | no | Minimum score to return a class, default `0.0` |
 | `classification_type` | no | `multi-label` (default, up to `top_k`) or `single-label` (best one) |
 | `top_k` | no | Cap on returned classes per text; default from `CLASSIFICATION_TOP_K` (`5`) |
+| `method` | no | `local` (default, local bi-encoder) or `albert` (Albert API bge-m3 retrieval + bge-reranker-v2-m3 rerank); default from `CLASSIFICATION_METHOD` |
 
 Example:
 
@@ -121,6 +144,7 @@ Response shape:
 ```jsonc
 {
   "source": "embedding_classification",
+  "method": "local",
   "model": "intfloat/multilingual-e5-large",
   "classification_type": "multi-label",
   "threshold": 0.0,
@@ -132,6 +156,32 @@ Response shape:
         {"dewey": "004", "label": "Informatique", "score": 0.88},
         {"dewey": "410", "label": "Linguistique générale", "score": 0.84},
         {"dewey": "510", "label": "Mathématiques", "score": 0.81}
+      ]
+    }
+  ]
+}
+```
+
+The `albert` method returns the **same shape**; only the metadata and the meaning
+of `score` change. The `score` is the cross-encoder's `relevance_score` passed
+through unchanged — these are reranker relevance scores, not cosine similarities,
+so they are not comparable to `local` scores:
+
+```jsonc
+{
+  "source": "albert_rerank_classification",
+  "method": "albert",
+  "model": "BAAI/bge-m3 + BAAI/bge-reranker-v2-m3",
+  "classification_type": "multi-label",
+  "threshold": 0.0,
+  "count": 1,
+  "results": [
+    {
+      "text": "Handbook on large language models and embeddings models.",
+      "classes": [
+        {"dewey": "004", "label": "Informatique", "score": 0.97},
+        {"dewey": "410", "label": "Linguistique générale", "score": 0.12},
+        {"dewey": "510", "label": "Mathématiques", "score": 0.04}
       ]
     }
   ]
@@ -177,8 +227,17 @@ Copy `.example.env` to `.env` and adjust values.
 | `EXAMPLES_PATH` | empty | Optional JSON of catalogued `{text, code}` examples for k-NN |
 | `EMBEDDING_EXAMPLE_WEIGHT` | `1.0` | Weight on the best example similarity when blending |
 | `CLASSIFICATION_TOP_K` | `5` | Default cap on returned classes per text |
-| `CLASSIFICATION_THRESHOLD` | `0.0` | Default minimum cosine similarity |
+| `CLASSIFICATION_THRESHOLD` | `0.0` | Default minimum score |
 | `CLASSIFICATION_TYPE` | `multi-label` | Default classification type |
+| `CLASSIFICATION_METHOD` | `local` | Default strategy (`local` or `albert`) |
+| `ALBERT_API_KEY` | empty | Albert API bearer token; required for `method=albert` |
+| `ALBERT_BASE_URL` | `https://albert.api.etalab.gouv.fr/v1` | Albert API base URL |
+| `ALBERT_EMBEDDING_MODEL` | `BAAI/bge-m3` | Albert remote bi-encoder (retrieval stage) |
+| `ALBERT_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | Albert remote cross-encoder (rerank stage) |
+| `ALBERT_QUERY_PREFIX` | empty | Optional query prefix for the Albert bi-encoder (bge-m3 needs none) |
+| `ALBERT_PASSAGE_PREFIX` | empty | Optional passage prefix for the Albert bi-encoder |
+| `ALBERT_TIMEOUT` | `30` | Per-call timeout (seconds) for Albert API requests |
+| `RERANK_CANDIDATES` | `20` | Bi-encoder candidate pool size handed to the reranker (`albert`) |
 
 ## Local run
 
